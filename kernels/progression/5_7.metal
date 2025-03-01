@@ -1,5 +1,6 @@
 #define MULT 1
 #define SIMDS_PER_TG 4
+#define GROUP_SIZE 64
 threadgroup uint shmemwq[2][SIMDS_PER_TG][32 * MULT]; // double buffering up to 8 simdgroups/tgroup 1KB per buffer (should increase to fetch more weights)
 threadgroup uint* shmemwq_ptr = (threadgroup uint*)shmemwq;
 
@@ -9,7 +10,7 @@ shmemwq_ptr += simdgroup_index_in_threadgroup * 32 * MULT;
 int K = X_shape[1]; 
 W += K * thread_position_in_grid.z;
 
-device uint* Wq = (device uint*)W;
+device uint* Wq = (device uint*)(W + thread_index_in_simdgroup);
 
 // prefetch weights
 metal::simdgroup_event active_weights_e;
@@ -17,7 +18,7 @@ metal::simdgroup_event inactive_weights_e;
 // threadgroup uint* shmemwq_ptr_write = (threadgroup uint*)shmemwq;
 threadgroup uint* shmemwq_ptr_write = shmemwq_ptr;
 threadgroup uint* shmemwq_ptr_read = shmemwq_ptr_write + 32 * SIMDS_PER_TG * MULT;
-active_weights_e.async_copy(shmemwq_ptr_write, Wq, ulong(32 * MULT));
+// active_weights_e.async_copy(shmemwq_ptr_write, Wq, ulong(32 * MULT));
 int wq_step_size = 32 * MULT;
 
 // metal::simdgroup_event active_e; // double buffer
@@ -42,9 +43,20 @@ scales += (row + leader * 2) * scales_shape[1];
 biases += (row + leader * 2) * biases_shape[1];
 const device half* scales2 = scales + scales_shape[1];
 const device half* biases2 = biases + biases_shape[1];
-int group_size_s = int(group_size) / int(8 * MULT);
+constexpr int group_size_s = GROUP_SIZE / int(8 * MULT);
 
 // debugW += 8 * thread_position_in_grid.z;
+
+
+// constexpr int lookup[32] = {
+//     0, 0, 1, 1, 2, 2, 3, 3,   // for x = 0..7
+//     0, 0, 1, 1, 2, 2, 3, 3,   // for x = 8..15
+//     4, 4, 5, 5, 6, 6, 7, 7,   // for x = 16..23
+//     4, 4, 5, 5, 6, 6, 7, 7    // for x = 24..31
+// };
+// X+=leader * 2 + lookup[thread_index_in_simdgroup] * X_shape[1];
+int offset = (((thread_index_in_simdgroup >> 4) & 1) << 2) | (((thread_index_in_simdgroup >> 2) & 1) << 1) | ((thread_index_in_simdgroup >> 1) & 1);
+X+=leader * 2 + offset * X_shape[1];
 
 // half cast_int4_inline[16] = {
 //     0.0, 1.0, 2.0, 3.0,
@@ -69,12 +81,11 @@ for(; k < iter_limit; k+=k_step_size) {
     half b1 = biases2[k / group_size_s];
 
     // initialize new transfer to shared
-    Wq += wq_step_size;
     {
         threadgroup uint* tmp = shmemwq_ptr_write;
         shmemwq_ptr_write = shmemwq_ptr_read;
         shmemwq_ptr_read = tmp;
-        inactive_weights_e.async_copy(shmemwq_ptr_write, Wq, ulong(32 * MULT));
+        // inactive_weights_e.async_copy(shmemwq_ptr_write, Wq, ulong(32 * MULT));
         thread simdgroup_event* e_helper = &inactive_weights_e;
         inactive_weights_e = active_weights_e;
         active_weights_e = *e_helper;
@@ -85,16 +96,21 @@ for(; k < iter_limit; k+=k_step_size) {
     //     // is this async? tryng doing before weights await
     //     simdgroup_load(sgMatrixX[u], &X[u*8], X_shape[1]);
     // }
-    metal::simdgroup_event::wait(1, &inactive_weights_e);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    thread ushort2 quantized_weights = as_type<ushort2>(*(shmemwq_ptr_read + thread_index_in_simdgroup));
+    // metal::simdgroup_event::wait(1, &inactive_weights_e);
+    // simdgroup_barrier(mem_flags::mem_threadgroup);
 
+    // thread ushort2 quantized_weights = as_type<ushort2>(*(shmemwq_ptr_read + thread_index_in_simdgroup));
+    thread ushort2 quantized_weights = *((device ushort2*)Wq);
+    Wq += wq_step_size;
+
+    #pragma unroll(2)
     for (ushort u = 0; u < 2; u++) {
         thread ushort packed_bits = quantized_weights[1 - u];
         simdgroup_matrix<half, 8, 8> sgMatrixW[2];
         simdgroup_matrix<half, 8, 8> sgMatrixX[2];
         
-        simdgroup_load(sgMatrixX[0], &X[u * 2 * 8], X_shape[1]);
+        // simdgroup_load(sgMatrixX[0], &X[u * 2 * 8], X_shape[1]);
+        *((thread half2*)&sgMatrixX[0].thread_elements()) = *((device half2*)&X[u * 2 * 8]);
         thread ushort wq0_0 = (packed_bits & 0xF000) >> 12;
         thread ushort wq0_1 = (packed_bits & 0x0F00) >> 8;
         thread half w0_0 = static_cast<half>(wq0_0);
@@ -108,7 +124,8 @@ for(; k < iter_limit; k+=k_step_size) {
         
         // simdgroup_store(sgMatrixW[0], &debugW[8 * (k + u * 2) * W_shape[0]], W_shape[0]);
         
-        simdgroup_load(sgMatrixX[1], &X[u * 2 * 8 + 8], X_shape[1]);
+        // simdgroup_load(sgMatrixX[1], &X[u * 2 * 8 + 8], X_shape[1]);
+        *((thread half2*)&sgMatrixX[1].thread_elements()) = *((device half2*)&X[u * 2 * 8 + 8]);
         thread ushort wq1_0 = (packed_bits & 0x00F0) >> 4;
         thread ushort wq1_1 = (packed_bits & 0x000F);
         thread half w1_0 = static_cast<half>(wq1_0);
@@ -132,7 +149,7 @@ for(; k < iter_limit; k+=k_step_size) {
     half b1 = biases2[k / group_size_s];
 
     // initialize new transfer to shared
-    Wq += wq_step_size;
+    // Wq += wq_step_size;
     {
         threadgroup uint* tmp = shmemwq_ptr_write;
         shmemwq_ptr_write = shmemwq_ptr_read;
@@ -148,16 +165,18 @@ for(; k < iter_limit; k+=k_step_size) {
     //     // is this async? tryng doing before weights await
     //     simdgroup_load(sgMatrixX[u], &X[u*8], X_shape[1]);
     // }
-    metal::simdgroup_event::wait(1, &inactive_weights_e);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-    thread ushort2 quantized_weights = as_type<ushort2>(*(shmemwq_ptr_read + thread_index_in_simdgroup));
+    // metal::simdgroup_event::wait(1, &inactive_weights_e);
+    // simdgroup_barrier(mem_flags::mem_threadgroup);
+    // thread ushort2 quantized_weights = as_type<ushort2>(*(shmemwq_ptr_read + thread_index_in_simdgroup));
+    thread ushort2 quantized_weights = *((device ushort2*)Wq);
 
     for (ushort u = 0; u < 2; u++) {
         thread ushort packed_bits = quantized_weights[1 - u];
         simdgroup_matrix<half, 8, 8> sgMatrixW[2];
         simdgroup_matrix<half, 8, 8> sgMatrixX[2];
         
-        simdgroup_load(sgMatrixX[0], &X[u * 2 * 8], X_shape[1]);
+        // simdgroup_load(sgMatrixX[0], &X[u * 2 * 8], X_shape[1]);
+        *((thread half2*)&sgMatrixX[0].thread_elements()) = *((device half2*)&X[u * 2 * 8]);
         thread ushort wq0_0 = (packed_bits & 0xF000) >> 12;
         thread ushort wq0_1 = (packed_bits & 0x0F00) >> 8;
         thread half w0_0 = static_cast<half>(wq0_0);
@@ -171,7 +190,8 @@ for(; k < iter_limit; k+=k_step_size) {
 
         // simdgroup_store(sgMatrixW[0], &debugW[8 * (k + u * 2) * W_shape[0]], W_shape[0]);
 
-        simdgroup_load(sgMatrixX[1], &X[u * 2 * 8 + 8], X_shape[1]);
+        // simdgroup_load(sgMatrixX[1], &X[u * 2 * 8 + 8], X_shape[1]);
+        *((thread half2*)&sgMatrixX[1].thread_elements()) = *((device half2*)&X[u * 2 * 8 + 8]);
         thread ushort wq1_0 = (packed_bits & 0x00F0) >> 4;
         thread ushort wq1_1 = (packed_bits & 0x000F);
         thread half w1_0 = static_cast<half>(wq1_0);
