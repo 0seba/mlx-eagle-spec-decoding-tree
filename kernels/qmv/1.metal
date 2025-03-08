@@ -2,7 +2,7 @@
 #define SIMD_SIZE 32
 #define GROUP_SIZE 64
 #define PACKS_PER_THREAD 1
-#define RESULTS_PER_SIMDGROUP 8
+#define RESULTS_PER_SIMDGROUP 4
 #define VALUES_PER_THREAD PACK_SIZE * PACKS_PER_THREAD
 // #define SCALE_STEP_PER_THREAD GROUP_SIZE / VALUES_PER_THREAD
 // #define BLOCK_SIZE SIMD_SIZE * VALUES_PER_THREAD
@@ -24,21 +24,29 @@ for(;k < W_shape[1];k+=(SIMD_SIZE * PACKS_PER_THREAD)) {
     #if (VALUES_PER_THREAD == 8)
     // thread vec<half, VALUES_PER_THREAD> _x = *(device vec<half, VALUES_PER_THREAD>*)(X); // cannot play with vector pointers
     thread float4 _x = *(device float4*)(X); // copy 8 values
-    thread half4* x = (thread half4*)&_x;
+    #elif (VALUES_PER_THREAD == 16)
+    thread ulong4 _x = *(device ulong4*)(X); // copy 16 values
     #endif
+    thread half4* x = (thread half4*)&_x;
     // thread float sum = 0;
     // #pragma clang unroll(full)
     // for(int i = 0;i < VALUES_PER_THREAD;i++) {
     //     sum += x[i];
     // }
+    
     for(int row = 0; row < RESULTS_PER_SIMDGROUP;row++) {
         thread vec<ushort, PACKS_PER_THREAD * 2> ws = *(device vec<ushort, PACKS_PER_THREAD * 2>*)(W + row * W_shape[1]);
+        #pragma unroll(PACKS_PER_THREAD * 2)
         for(int u = 0; u < PACKS_PER_THREAD * 2;u++) {
             thread half4 w = half4(
                 ((ws[u] & ushort(0x000f)) / 1.0h) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]],
                 ((ws[u] & ushort(0x00f0)) / 16.0h) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]],
                 ((ws[u] & ushort(0x0f00)) / 256.0h) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]],
                 ((ws[u] & ushort(0xf000)) / 4096.0h) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]]
+                // uint4_to_float16_shift(ushort((ws[u] & ushort(0x000f)) << 8)) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]],
+                // uint4_to_float16_shift(ushort((ws[u] & ushort(0x00f0)) << 4)) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]],
+                // uint4_to_float16_shift((ws[u] & ushort(0x0f00))) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]],
+                // uint4_to_float16_shift(((ws[u] & ushort(0xf000)) >> 4)) * scales[row * scales_shape[1]] + biases[row * scales_shape[1]]
             );
             y[row] += dot(float4(x[u]), float4(w));
         }
@@ -50,8 +58,12 @@ for(;k < W_shape[1];k+=(SIMD_SIZE * PACKS_PER_THREAD)) {
 }
 
 result += thread_position_in_grid.z * RESULTS_PER_SIMDGROUP;
+#pragma unroll(RESULTS_PER_SIMDGROUP)
 for(int row = 0; row < RESULTS_PER_SIMDGROUP;row++) {
     y[row] = simd_sum(y[row]);
+    // if (thread_index_in_simdgroup  == 0) {
+    //     result[row] = y[row];
+    // }
 }
 if (thread_index_in_simdgroup < RESULTS_PER_SIMDGROUP) {
     result[thread_index_in_simdgroup] = y[thread_index_in_simdgroup];

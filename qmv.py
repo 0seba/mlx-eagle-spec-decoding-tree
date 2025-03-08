@@ -6,7 +6,9 @@ import time
 import shutil
 
 
-FILE_PATH = "kernels/qmv/1.metal"
+# FILE_PATH = "kernels/qmv/1.metal"
+FILE_PATH = "kernels/qmv/1b.metal"
+# FILE_PATH = "kernels/qmv/2.metal"
 HELPERS_PATH = "kernels/qmv/helpers.metal"
 
 with open("kernels/mfa_async_ulong.metal", "r") as f:
@@ -21,14 +23,63 @@ headers = [
     "using namespace metal;",
     async_source,
     helpers_source,
-    """""",
+    """
+inline half uint4_to_float16_shift(thread ushort x) {
+    half xcast = as_type<half>(ushort(ushort(0x4000) | x));
+    // return x ? xcast : 0.0h;
+    return xcast;
+}
+    """,
 ]
 with open(FILE_PATH, "r") as f:
     source = f.read()
 
 
-
 def qmv(
+    x,
+    w,
+    s,
+    b,
+    group_size,
+    kernel,
+    d_dtype=mx.float16,
+    verbose=False,
+    debug=False,
+    simd_groups=4,
+):
+    *B, K = x.shape
+    M = w.shape[0]
+    # z_threads = min(24_576 // 32, M // 8)
+    y_threads = max(1, M // 4)
+    thread_group_y = min(simd_groups, y_threads)
+
+    WIGHTS_PER_ELEMENT = {
+        mx.int32: 4,
+        mx.int64: 8,
+        # these aren't accesible from mlx, maybe with header macro
+        # "ulong2": 16,
+        # "ulong4": 32,
+    }
+
+    outputs = kernel(
+        inputs=[x, w, s, b, group_size],
+        # template=[],
+        grid=(
+            32,
+            y_threads,
+            1,
+            # 1,
+        ),  # Max number of threads is 24,576, this means every I have to make every threadgroup compute more of the output columns
+        threadgroup=(32, thread_group_y, 1),
+        output_shapes=[(*B, M), (K, M)] if debug else [(*B, M)],
+        output_dtypes=[d_dtype, mx.float16] if debug else [d_dtype],
+        verbose=verbose,
+    )
+
+    return outputs
+
+
+def qmv_quad(
     x,
     w,
     s,
@@ -42,10 +93,11 @@ def qmv(
     shmem_load_size=1,
     debug=False,
 ):
-    K = x.shape[-1]
+    *B, K = x.shape
     M = w.shape[0]
-    z_threads = min(24_576 // 32, M // 8)
-    thread_group_z = min(8, z_threads)
+    # z_threads = min(24_576 // 32, M // 8)
+    z_threads = max(1, M)
+    thread_group_z = min(16, z_threads)
 
     WIGHTS_PER_ELEMENT = {
         mx.int32: 4,
@@ -68,13 +120,13 @@ def qmv(
         inputs=[x, w, s, b, group_size],
         # template=[],
         grid=(
-            32,
+            4,
             1,
             z_threads,
             # 1,
         ),  # Max number of threads is 24,576, this means every I have to make every threadgroup compute more of the output columns
-        threadgroup=(32, 1, thread_group_z),
-        output_shapes=[(x.shape[0], M), (K, M)] if debug else [(x.shape[0], M)],
+        threadgroup=(4, 1, thread_group_z),
+        output_shapes=[(*B, M), (K, M)] if debug else [*B, M],
         output_dtypes=[d_dtype, mx.float16] if debug else [d_dtype],
         verbose=verbose,
     )
@@ -85,12 +137,25 @@ def qmv(
 def round_cast(x, *args, **kwargs):
     return mx.round(x.astype(mx.float32), *args, **kwargs)
 
+
 def round_to_list(x, decimals):
     return [round(v, decimals) for v in x.tolist()]
 
+
 def print_2d(x, decimals):
     for row in x:
-        print('  '.join("{: 1.{prec}f}".format(v, prec=decimals) for v in row))
+        print("  ".join("{: 1.{prec}f}".format(v, prec=decimals) for v in row))
+
+
+def washout():
+    mx.synchronize()
+    mx.eval(
+        mx.full((10 * 1024**2,), 1.0) * mx.full(10 * 1024**2, 2.0)
+    )  # clear cache, each of this is 40MB
+    mx.synchronize()
+    mx.metal.clear_cache()
+    mx.synchronize()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -122,11 +187,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Print generated kernels",
     )
+    parser.add_argument("--simd-groups", "-s", type=int, default=4)
     parser.add_argument("--slice", type=int, default=None)
     parser.add_argument("-N", type=int, default=1)
     parser.add_argument("-K", type=int, default=256)
     parser.add_argument("-M", type=int, default=8)
     parser.add_argument("--benchmark", "-b", action="store_true", default=False)
+    parser.add_argument("--model-benchmark", "-mb", action="store_true", default=False)
     parser.add_argument("--debug", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -160,7 +227,60 @@ if __name__ == "__main__":
     # print_2d(x[:, :32], 3)
     # print("-" * 20)
 
-    mx.synchronize()
+    mx.eval(w, wiq)
+    washout()
+
+    target = []
+    for i in range(args.N):
+        target.append(mx.quantized_matmul(x[i], wq, s, b))
+    target = mx.stack(target)
+    mx.eval(target)
+
+    x0 = x[[0]]
+    mx.eval(x0)
+    kernel_vector = mx.fast.metal_kernel(
+        name="qmv_vector",
+        input_names=["X", "W", "scales", "biases", "group_size"],
+        output_names=["result", "debugW"] if args.debug else ["result"],
+        source=source,
+        header="\n".join(headers + ["#define BATCH_SIZE 1"]) + "\n\n",
+        # atomic_outputs=True,
+    )
+    kernel_batched = mx.fast.metal_kernel(
+        name="qmv_batch",
+        input_names=["X", "W", "scales", "biases", "group_size"],
+        output_names=["result", "debugW"] if args.debug else ["result"],
+        source=source,
+        header="\n".join(headers + ["#define BATCH_SIZE " + str(args.N)]) + "\n\n",
+        # atomic_outputs=True,
+    )
+
+    # warmup?
+    for _ in range(5):
+        qmv(
+            x,
+            wq,
+            s,
+            b,
+            group_size=args.slice if args.slice else 64,
+            kernel=kernel_batched,
+            verbose=args.verbose,
+            debug=args.debug,
+            simd_groups=args.simd_groups,
+        )
+        qmv(
+            # o = qmv_quad(
+            x0,
+            wq,
+            s,
+            b,
+            group_size=args.slice if args.slice else 64,
+            kernel=kernel_vector,
+            verbose=args.verbose,
+            debug=args.debug,
+            simd_groups=args.simd_groups,
+        )
+    washout()
 
     if args.enable_capture:
         # Make sure that the path trace_file does not already exist.
@@ -169,21 +289,21 @@ if __name__ == "__main__":
             shutil.rmtree(args.capture_name)
         mx.metal.start_capture(args.capture_name)
 
-    # print(wiq[:6, :6])
-    # print(w[:6, :6])
-    # print(x[:6, :6])
+    # if args.N > 1:
+    #     target_batch = mx.quantized_matmul(x, wq, s, b)
+    #     mx.eval(target_batch)
+    #     washout()
+    # for batch size 1 tracing
+    washout()
+    target_x0 = mx.quantized_matmul(x0, wq, s, b)
+    mx.eval(target_x0)
+    washout()
 
-    mx.eval(mx.quantized_matmul(x[0], wq, s, b))
+    # if args.slice:
+    #     target = mx.matmul(x, w.T)
+    # else:
+    #     target = mx.quantized_matmul(x, wq, s, b)
 
-    mx.synchronize()
-
-    if args.slice:
-        target = mx.matmul(x, w.T)
-    else:
-        target = mx.quantized_matmul(x, wq, s, b)
-
-    mx.eval(target)
-    mx.synchronize()
     # print("-" * 20, "TARGET")
     # print(target)
     # print("-" * 20)
@@ -194,42 +314,40 @@ if __name__ == "__main__":
     # print_2d(b, 3)
     # print("-" * 20)
 
+
     o = qmv(
+        # o = qmv_quad(
         x,
         wq,
         s,
         b,
         group_size=args.slice if args.slice else 64,
+        kernel=kernel_batched,
         verbose=args.verbose,
         debug=args.debug,
+        simd_groups=args.simd_groups,
     )
+    mx.eval(o)
+    print(o)
+    washout()
 
-    # print(s.shape)
-    # print(s)
-    # print(b.shape)
-    # print(b)
-    # print(mx.dequantize(wq, s, b))
-    # print()
-    # print(wq)
-    # print(o[-1])
-    # print((mx.dequantize(wq, s, b) - o[1]))
-    # print((o[1] == mx.dequantize(wq, s, b)).all())
-    # for row in o[1].tolist():
-    #     print(row)
-    # _s = mx.repeat(s, 64, 1)
-    # _b = mx.repeat(b, 64, 1)
-    # for r1, r2 in zip(o[1].tolist(), (round_cast((mx.dequantize(wq)).tolist()):
-
-    # w = round_cast((w - mx.repeat(b, sK, 1)) / mx.repeat(s, sK, 1))
-
-    # print(round_cast(o[1]))
-    # print(round_cast(w))
-
-    # print(round_cast(o[1]).tolist())
-    # print(round_cast(w).tolist())
+    o1 = qmv(
+        # o = qmv_quad(
+        x0,
+        wq,
+        s,
+        b,
+        group_size=args.slice if args.slice else 64,
+        kernel=kernel_vector,
+        verbose=args.verbose,
+        debug=args.debug,
+        simd_groups=args.simd_groups,
+    )
+    mx.eval(o1)
     mx.synchronize()
 
-    print(o)
+    if args.enable_capture:
+        mx.metal.stop_capture()
 
     if len(o) > 1:
         _wt = w.T
@@ -272,40 +390,107 @@ if __name__ == "__main__":
     print((o[0] != target).sum())
     # print(o[1])
 
-
-    if args.enable_capture:
-        mx.metal.stop_capture()
-
-    compiled_mm = mx.compile(qmv)
-    if args.benchmark:
+    def benchmark(f, xinput=None):
+        # to test batch 1 speed
+        if xinput is None:
+            xinput = x
         times = []
         mx.synchronize()
-        for i in range(13):
+        for i in range(20):
             tic = time.perf_counter()
             # mx.eval(qmv(x, w, s, b, 64))
-            mx.eval(compiled_mm(x, w, s, b, 64))
+            mx.eval(f(xinput, wq, s, b))
             toc = time.perf_counter()
             times.append(toc - tic)
-            mx.metal.clear_cache()
-            mx.eval(mx.full((10 * 1024 ** 2,), 1.0) + mx.full(10 * 1024 ** 2, 2.0)) # clear cache, each of this is 40MB
+            washout()
 
-        times = times[3:]
-        print(f"Average time: {sum(times) / len(times)}")
-        print(f"Median time: {sorted(times)[len(times) // 2]}")
+        times = times[10:]
+        # return mean and median
+        return (sum(times) / len(times), sorted(times)[len(times) // 2])
 
-        mx.synchronize()
-        compiled_mm = mx.compile(mx.quantized_matmul)
-        mlx_matmul_times = []
-        for _ in range(13):
-            tic = time.perf_counter()
-            mx.eval(compiled_mm(x, wq, s, b))
-            toc = time.perf_counter()
-            mlx_matmul_times.append(toc - tic)
-            mx.metal.clear_cache()
-            mx.eval(mx.full((10 * 1024 ** 2,), 1.0) + mx.full(10 * 1024 ** 2, 2.0)) # clear cache, each of this is 40MB
+    def bench_print(f, name, xinput=None):
+        mean, median = benchmark(f, xinput)
+        print(f"Average time {name}: {mean}")
+        print(f"Median time {name}: {median}")
 
-        times = mlx_matmul_times[3:]
-        print(f"Average time MLX mm: {sum(times) / len(times)}")
-        print(f"Median time MLX mm: {sorted(times)[len(times) // 2]}")
+    if args.benchmark:
+        from functools import partial
 
-    pass
+        washout()
+
+        custom_method = qmv
+        custom_method_vector = partial(custom_method, group_size=64, kernel=kernel_vector)
+        compiled_custom_vector = mx.compile(custom_method_vector)
+        custom_method_batched = partial(custom_method, group_size=64, kernel=kernel_batched)
+        compiled_custom_batched = mx.compile(custom_method_batched)
+
+        bench_print(compiled_custom_batched, f"Custom compiled batch size {args.N}")
+        print("-" * 20)
+        bench_print(compiled_custom_vector, f"Custom compiled batch size 1", x0)
+        print("-" * 20)
+        bench_print(custom_method_batched, f"Custom Not-compiled batch size {args.N}")
+        print("-" * 20)
+        bench_print(custom_method_vector, f"Custom Not-compiled batch size 1", x0)
+        print("-" * 20)
+
+        compiled_mlx = mx.compile(mx.quantized_matmul)
+        bench_print(compiled_mlx, f"MLX compiled batch size {args.N}")
+        print("-" * 20)
+        bench_print(compiled_mlx, f"MLX compiled batch size 1", x0)
+        print("-" * 20)
+        bench_print(mx.quantized_matmul, f"MLX Not-compiled batch size {args.N}")
+        print("-" * 20)
+        bench_print(mx.quantized_matmul, f"MLX Not-compiled batch size 1", x0)
+        print("-" * 20)
+
+    if args.model_benchmark:
+        from mlx_model_fwd_bench import bench
+        from mlx_lm.utils import load_model
+
+        class NewQuantizedLinear(QuantizedLinear):
+            def __init__(self, qlayer: QuantizedLinear):
+                Module.__init__(self)  # Initialize from Module instead of QuantizedLinear
+                
+                # Quantization config
+                self.group_size = qlayer.group_size
+                self.bits = qlayer.bits
+
+                # Initialize the quantized weight
+                self.weight, self.scales, self.biases = qlayer.weight, qlayer.scales, qlayer.biases
+
+                if "bias" in qlayer:
+                    self.bias = qlayer.bias
+
+                # Freeze this model's parameters
+                self.freeze()
+
+            def __call__(self, x):
+                if x.shape[1] != 1:
+                    return super().__call__(x)
+                x = qmv(x, self.weight, self.scales, self.biases, self.group_size)[0]
+                if "bias" in self:
+                    x = x + self.bias
+                return x
+
+        def patch_quantized(model: Module):
+            def _maybe_quantize(path, m):
+                if isinstance(m, QuantizedLinear):
+                    return NewQuantizedLinear(m)
+                else:
+                    return m
+
+            leaves = model.leaf_modules()
+            leaves = tree_map_with_path(_maybe_quantize, leaves, is_leaf=Module.is_module)
+            model.update_modules(leaves)
+
+
+        model, _ = load_model("mlx-community/Llama-3.2-1B-Instruct-4bit")
+        tps_mlx_bs1 = bench(model, 1)
+        tps_mlx_bs_ = bench(model, args.N)
+
+        # custom_method = qmv
+        # custom_method = partial(custom_method, group_size=64)
+        # compiled_custom = mx.compile(custom_method)
+
+        patch_quantized(model)
+
