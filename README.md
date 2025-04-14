@@ -6,7 +6,7 @@ I haven't performed a lot of tests on >=M3/A17, but the time should be the same 
 
 The RoPE kernel had to be modified to support tree mask attention, which caused additional slowdowns, but slow in comparison.
 
-**IMPORTANT: Current code only works with Llama3/Qwen2 architectures and both target and draft model have to be 4 bit quantized.**
+**IMPORTANT: Current code only works with Llama3/Qwen2 architectures, both target and draft model have to be 4 bit quantized and uses greedy decoding, no sampling yet**
 
 Testing on M1 Air 8GB with the following command `python mlx_eagle.py --prompt "How many positive whole-number divisors does 196 have?" --depth 3 --verify-num-tokens 7 --max-tokens 300 -N 300` I get around 22 tokens per second, with 4.5 tokens generated per single evaluation of the target model, compared to 18 tokens per second using `mlx_lm.generate` with `--num-draft-tokens 2` for the same target `Qwen2.5 7B` and draft models `Qwen2.5 0.5B`.
 
