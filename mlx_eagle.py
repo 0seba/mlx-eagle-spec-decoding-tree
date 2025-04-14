@@ -1,7 +1,8 @@
+import math
+import argparse
 from typing import List, Union, Optional
 
-import math
-import numpy as np
+# import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -616,20 +617,87 @@ class WiredLimitModel(nn.Module):
         self.base_model = base_model
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate text using draft and base models with specified parameters.")
+
+    # Model arguments
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        # default="mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit",
+        default="mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+        help="Name of the draft model to use."
+    )
+    parser.add_argument(
+        "--base-model",
+        type=str,
+        # default="mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit",
+        default="mlx-community/Qwen2.5-7B-Instruct-4bit",
+        help="Name of the base model to use."
+    )
+
+    # Prompt arguments
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        required=True,
+        help="The user prompt for the model."
+    )
+
+    # Generation parameters
+    # parser.add_argument(
+    #     "--k",
+    #     type=int,
+    #     default=8,
+    #     help="Value of k for generation."
+    # )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        help="Value of depth for generation."
+    )
+    parser.add_argument(
+        "--verify-num-tokens",
+        type=int,
+        default=15,
+        help="Number of tokens to verify, has to be 7, 15, 23 or 31."
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=300,
+        help="Maximum number of tokens to generate."
+    )
+    parser.add_argument(
+        "--max-generation-steps",
+        "-N",
+        type=int,
+        default=300,
+        help="Number of steps to generate."
+    )
+
+    args = parser.parse_args()
+    return args
+
 if __name__ == "__main__":
     # model_name = "mlx-community/SmolLM2-1.7B-Instruct"
     # model_name = "mlx-community/Llama-3.2-1B-Instruct-bf16"
     # draft_name = "mlx-community/Llama-3.2-1B-Instruct-4bit"
     # draft_name = "mlx-community/Llama-3.2-1B-Instruct-4bit"
     # draft_name = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-    draft_name = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit"
+    # draft_name = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit"
     # draft_name = "mlx-community/Qwen2.5-1B-Instruct-4bit"
     # base_name = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
     # base_name = "mlx-community/Qwen2.5-3B-Instruct-4bit"
     # base_name = "mlx-community/Qwen2.5-7B-Instruct-4bit"
-    base_name = "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit"
+    # base_name = "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit"
     # base_name = "mlx-community/Llama-3.2-3B-Instruct-4bit"
     # model, tokenizer = mlx_lm.load(model_name, tokenizer_config={})
+    args = parse_args()
+    draft_name = args.draft_model
+    base_name = args.base_model
+
     draft_model, tokenizer = load(draft_name, tokenizer_config={})
     base_model, _ = load(base_name, tokenizer_config={})
 
@@ -645,7 +713,8 @@ if __name__ == "__main__":
             tokenizer.chat_template = tokenizer.default_chat_template
 
     # prompt = "Tell me a joke poem about Harry Potter"
-    prompt = "How many positive whole-number divisors does 196 have?"
+    # prompt = "How many positive whole-number divisors does 196 have?"
+    prompt = args.prompt
 
     system_prompt = None
     if system_prompt is not None:
@@ -677,10 +746,11 @@ if __name__ == "__main__":
             base_model=base_model,
             draft_model=draft_model,
             tokenizer=tokenizer,
+            # k=args.k,
             k=8,
-            depth=0,
-            verify_num_tokens=7,
-            max_tokens=300,
+            depth=args.depth,
+            verify_num_tokens=args.verify_num_tokens,
+            max_tokens=args.max_tokens,
             prefill_step_size=512,
-            N=300,
+            N=args.max_generation_steps,
         )
