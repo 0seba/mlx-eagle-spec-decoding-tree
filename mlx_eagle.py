@@ -1,14 +1,19 @@
 from typing import List, Union, Optional
 
 import math
+import numpy as np
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.models.cache import KVCache, make_prompt_cache
+from mlx_lm.utils import wired_limit
 
 from mlx_utils import load
 from mlx_llama import Model as LlamaModel
 from mlx_llama import Model as Qwen2Model
 from utils import Performer
+from mlx_model_fwd_bench import patch_model
+from qmm_kernel import matmul as qmm
 
 # from mlx_lm.models.llama import Model as LlamaModel
 
@@ -145,7 +150,7 @@ def generate_draft_tree(
 
     topk_cs_index = mx.arange(k, dtype=mx.uint32)
 
-    # phrases_debugger = current_input_ids[0, :, None]
+    phrases_debugger = current_input_ids[0, :, None]
     # print(tokenizer._tokenizer.batch_decode(np.array(phrases_debugger)))
 
     for i in range(depth):
@@ -185,8 +190,10 @@ def generate_draft_tree(
             k=k,
         )
 
-        # phrases_debugger = phrases_debugger[out_ids]
-        # phrases_debugger = mx.concatenate((phrases_debugger, new_input_ids[0, :, None]), axis=1)
+        phrases_debugger = phrases_debugger[out_ids]
+        phrases_debugger = mx.concatenate(
+            (phrases_debugger, new_input_ids[0, :, None]), axis=1
+        )
         current_input_ids = new_input_ids
 
         saved_topk_indices.append(topk_index)
@@ -197,6 +204,10 @@ def generate_draft_tree(
         # saved_topk_cs_indices.append(topk_cs_index)
 
         mask = mask[..., out_ids, :]
+
+    # print()
+    # print(tokenizer._tokenizer.batch_decode(np.array(phrases_debugger)))
+    # print()
 
     return parents_list, saved_topk_indices, saved_cu_scores
 
@@ -379,20 +390,29 @@ def spec_step(
     tokenizer=None,
 ):
     base_offset = base_cache[0].offset
+    draft_offset = draft_cache[0].offset + 1 + accept_length
 
-    mx.eval(y, *draft_cache)
-    performer.tic("init")
+    # mx.eval(y, *draft_cache)
+    # performer.tic("init")
 
-    draft_logits = draft_model(y, cache=draft_cache)[:, [-1]]
-    draft_offset = draft_cache[0].offset
+    _y = y
+    if accept_length > 0:
+        pad_size = 8 - accept_length - 1
+        # pad to 8
+        y = mx.concatenate((y, mx.zeros((1, pad_size), dtype=mx.int32)), axis=-1)
+        draft_logits = draft_model(y, cache=draft_cache)[:, [accept_length]]
+        for cache in draft_cache:
+            cache.offset = draft_offset
+    else:
+        draft_logits = draft_model(y, cache=draft_cache)[:, [accept_length]]
     # draft_logits = mx.softmax(draft_logits, axis=-1).log()
     lse = draft_logits.logsumexp(axis=-1)
     topk_index, topk_p = topk(mx.squeeze(draft_logits, 1), k, -1)
     topk_p = mx.expand_dims(topk_p - lse, -1)
 
-    mx.eval(topk_index, topk_p, *draft_cache)
-    performer.toc("init")
-    performer.tic("generate_tree")
+    # mx.eval(topk_index, topk_p, *draft_cache)
+    # performer.toc("init")
+    # performer.tic("generate_tree")
 
     out_parents, out_tokens, out_scores = generate_draft_tree(
         topk_index=topk_index,
@@ -404,21 +424,21 @@ def spec_step(
         k=k,
         tokenizer=tokenizer,
     )
-    mx.eval(out_parents, out_tokens, out_scores)
-    performer.toc("generate_tree")
-    performer.tic("process_draft_tree")
+    # mx.eval(out_parents, out_tokens, out_scores)
+    # performer.toc("generate_tree")
+    # performer.tic("process_draft_tree")
 
     tree_position_ids, mask_index, draft_tokens, tree_mask = process_draft_tree(
         scores_list=out_scores,
         ss_token=out_tokens,
         parents_list=out_parents,
-        sampled_token_id=y[:, [-1]],
+        sampled_token_id=_y[:, [-1]],
         k=k,
         total_tokens=verify_num_tokens,
     )
-    mx.eval(tree_position_ids, mask_index, draft_tokens, tree_mask)
-    performer.toc("process_draft_tree")
-    performer.tic("tree_decoding")
+    # mx.eval(tree_position_ids, mask_index, draft_tokens, tree_mask)
+    # performer.toc("process_draft_tree")
+    # performer.tic("tree_decoding")
 
     base_logits = tree_decoding(
         token_ids=draft_tokens,
@@ -428,18 +448,27 @@ def spec_step(
         tree_position_ids=tree_position_ids,
     )
 
-    mx.eval(base_logits)
-    performer.toc("tree_decoding")
-    performer.tic("post_process_draft_tree")
+    # mx.eval(base_logits)
+    # performer.toc("tree_decoding")
+    # performer.tic("post_process_draft_tree")
+
+    return (
+        tree_position_ids,
+        mask_index,
+        draft_tokens,
+        base_logits,
+        base_offset,
+        draft_offset,
+    )
 
     retrieve_indices = post_process_draft_tree(
         tree_position_ids=tree_position_ids,
         total_tokens=verify_num_tokens,
         mask_index=mask_index,
     )
-    mx.eval(retrieve_indices)
-    performer.toc("post_process_draft_tree")
-    performer.tic("evaluate_posterior_greedy")
+    # mx.eval(retrieve_indices)
+    # performer.toc("post_process_draft_tree")
+    # performer.tic("evaluate_posterior_greedy")
 
     candidates = draft_tokens[0, retrieve_indices]
     # print("\n\nDraft candidates:")
@@ -449,6 +478,7 @@ def spec_step(
     (best_candidates, new_accept_length, sample_p) = evaluate_posterior_greedy(
         base_logits[0, retrieve_indices], candidates
     )
+
     new_accept_length = new_accept_length.item()
     accept_indices = retrieve_indices[best_candidates, 1 : 1 + new_accept_length]
     accepted_tokens = candidates[best_candidates, 1 : 1 + new_accept_length]
@@ -503,7 +533,7 @@ def generate_step(
     y = mx.argmax(base_logits[:, -1], -1, keepdims=True)
     mx.eval(y)
 
-    print(tokenizer.decode(y.item()), end="", flush=True)
+    # print(tokenizer.decode(y.item()), end="", flush=True)
 
     n = 0
     accept_length = 0
@@ -514,8 +544,17 @@ def generate_step(
         if n >= max_tokens:
             break
 
-        performer.tic("spec_step")
-        accepted_tokens, accept_length, sample_p = spec_step(
+        # performer.tic("spec_step")
+        # accepted_tokens, accept_length, sample_p = spec_step(
+        # schedule async execution of operations graph that does not have any break
+        (
+            tree_position_ids,
+            mask_index,
+            draft_tokens,
+            base_logits,
+            base_offset,
+            draft_offset,
+        ) = spec_step(
             y,
             base_model=base_model,
             draft_model=draft_model,
@@ -528,47 +567,85 @@ def generate_step(
             verify_num_tokens=verify_num_tokens,
             tokenizer=tokenizer,
         )
-        next_token_id = sample_p.argmax(-1, keepdims=True)
-        y = mx.expand_dims(mx.concatenate((accepted_tokens, next_token_id), 0), 0)
-        mx.eval(y)
-        performer.toc("spec_step")
+        mx.async_eval(tree_position_ids, mask_index, draft_tokens, base_logits)
 
         print(tokenizer.decode(y[0].tolist()), end="", flush=True)
-        # accept_length = accept_length.item()
+
+        # the following operations have cpu synchronization so they are executed after the print
+        retrieve_indices = post_process_draft_tree(
+            tree_position_ids=tree_position_ids,
+            total_tokens=verify_num_tokens,
+            mask_index=mask_index,
+        )
+
+        candidates = draft_tokens[0, retrieve_indices]
+        (best_candidates, accept_length, sample_p) = evaluate_posterior_greedy(
+            base_logits[0, retrieve_indices], candidates
+        )
+
+        accept_length = accept_length.item()
+        accept_indices = retrieve_indices[best_candidates, 1 : 1 + accept_length]
+        accepted_tokens = candidates[best_candidates, 1 : 1 + accept_length]
+
+        accept_candidate(base_cache, accept_indices, accept_length, base_offset)
+
+        for c in draft_cache:
+            c.offset = draft_offset
+
+        next_token_id = sample_p.argmax(-1, keepdims=True)
+        y = mx.expand_dims(mx.concatenate((accepted_tokens, next_token_id), 0), 0)
 
         n += 1 + accept_length
 
     performer.toc("total")
     print()
     performer.print_all_averages_ms(rounding_digits=3)
-    print("generad tokens", n)
-    print("accepted per step:", n / N)
-    print("tokens per second:", n / performer.counters["total"][-1])
+    print("Generated Tokens", n)
+    print("Mean Tokens Per Step:", n / (i + 1))
+    print("Tokens Per Second:", round(n / performer.counters["total"][-1], 1))
 
 
 def stream_generate():
     pass
 
 
+class WiredLimitModel(nn.Module):
+    def __init__(self, draft_model, base_model):
+        super().__init__()
+        self.draft_model = draft_model
+        self.base_model = base_model
+
+
 if __name__ == "__main__":
     # model_name = "mlx-community/SmolLM2-1.7B-Instruct"
     # model_name = "mlx-community/Llama-3.2-1B-Instruct-bf16"
     # draft_name = "mlx-community/Llama-3.2-1B-Instruct-4bit"
-    draft_name = "mlx-community/Llama-3.2-1B-Instruct-4bit"
+    # draft_name = "mlx-community/Llama-3.2-1B-Instruct-4bit"
     # draft_name = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    draft_name = "mlx-community/DeepSeek-R1-Distill-Qwen-1.5B-4bit"
+    # draft_name = "mlx-community/Qwen2.5-1B-Instruct-4bit"
     # base_name = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
     # base_name = "mlx-community/Qwen2.5-3B-Instruct-4bit"
-    base_name = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+    # base_name = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    base_name = "mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit"
+    # base_name = "mlx-community/Llama-3.2-3B-Instruct-4bit"
     # model, tokenizer = mlx_lm.load(model_name, tokenizer_config={})
     draft_model, tokenizer = load(draft_name, tokenizer_config={})
     base_model, _ = load(base_name, tokenizer_config={})
+
+    def kernel(*args):
+        return qmm(*args)[0]
+
+    patch_model(draft_model, kernel)
+    patch_model(base_model, kernel)
 
     use_default_chat_template = True
     if use_default_chat_template:
         if tokenizer.chat_template is None:
             tokenizer.chat_template = tokenizer.default_chat_template
 
-    prompt = "Tell me a joke poem about Harry Potter"
+    # prompt = "Tell me a joke poem about Harry Potter"
+    prompt = "How many positive whole-number divisors does 196 have?"
 
     system_prompt = None
     if system_prompt is not None:
@@ -591,15 +668,19 @@ if __name__ == "__main__":
     )
     print(tokenizer.decode(prompt.tolist()))
 
-    generate_step(
-        prompt=prompt,
-        base_model=base_model,
-        draft_model=draft_model,
-        tokenizer=tokenizer,
-        k=4,
-        depth=5,
-        verify_num_tokens=32,
-        max_tokens=128,
-        prefill_step_size=512,
-        N=20,
-    )
+    generation_stream = mx.new_stream(mx.default_device())
+
+    wired_model = WiredLimitModel(draft_model, base_model)
+    with wired_limit(wired_model, [generation_stream]):
+        generate_step(
+            prompt=prompt,
+            base_model=base_model,
+            draft_model=draft_model,
+            tokenizer=tokenizer,
+            k=8,
+            depth=0,
+            verify_num_tokens=7,
+            max_tokens=300,
+            prefill_step_size=512,
+            N=300,
+        )

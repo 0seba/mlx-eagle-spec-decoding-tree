@@ -4,6 +4,7 @@ import mlx.core as mx
 import argparse
 import time
 import shutil
+from functools import reduce
 
 from numpy import mat
 
@@ -11,7 +12,7 @@ from swizzle import swizzle
 from utils import print_2d, washout, bench_print
 
 import mlx.nn as nn
-from mlx_lm.models.llama import  LlamaModel, ModelArgs, Model
+from mlx_lm.models.llama import LlamaModel, ModelArgs, Model
 
 # FILE_PATH = "kernels/simd_qmm.metal"
 # FILE_PATH = "kernels/simd_qmm_gpt.metal"
@@ -20,6 +21,7 @@ from mlx_lm.models.llama import  LlamaModel, ModelArgs, Model
 # FILE_PATH = "kernels/progression/3.metal"
 # FILE_PATH = "kernels/progression/5_7_1.metal"
 FILE_PATH = "kernels/progression/simd_no_swizzle_cast.metal"
+# FILE_PATH = "kernels/progression/simd_no_swizzle_const_lut.metal"
 
 with open("kernels/mfa_async_ulong.metal", "r") as f:
     # with open("kernels/mfa_async.metal", "r") as f:
@@ -76,6 +78,9 @@ def floor_multiple_2(n):
     return min(2 * (n // 2), 1)
 
 
+kernels = {}
+
+
 def matmul(
     x,
     w,
@@ -92,9 +97,10 @@ def matmul(
     debug=False,
 ):
     *B, K = x.shape
+    _B = reduce(lambda x, y: x * y, B)
     M = w.shape[0]
     # z_threads = min(24_576 // 32, M // 8)
-    z_threads = M // 8 # seems that Metal somehow handles more than 24_576 threads
+    z_threads = M // 8  # seems that Metal somehow handles more than 24_576 threads
     thread_group_z = min(simds_per_threadgroup, z_threads)
 
     WIGHTS_PER_ELEMENT = {
@@ -105,14 +111,26 @@ def matmul(
         # "ulong4": 32,
     }
 
-    kernel = mx.fast.metal_kernel(
-        name="matmul",
-        input_names=["X", "W", "scales", "biases", "group_size"],
-        output_names=["result", "debugW", "debugX"] if debug else ["result"],
-        source=source,
-        header="\n".join(headers + [f"#define SIMDGROUPS_PER_THREADGROUP {simds_per_threadgroup}"]) + "\n\n",
-        # atomic_outputs=True,
-    )
+    if _B not in kernels:
+        kernels[_B] = mx.fast.metal_kernel(
+            name=f"matmul_batch_{_B}_gs_{group_size}",
+            input_names=["X", "W", "scales", "biases", "group_size"],
+            output_names=["result", "debugW", "debugX"] if debug else ["result"],
+            source=source,
+            # this should be done with template and not headers
+            # but with headers it allows for metal tracing in M1
+            header="\n".join(
+                headers
+                + [
+                    f"#define SIMDGROUPS_PER_THREADGROUP {simds_per_threadgroup}",
+                    f"#define BATCH_SIZE {_B}",
+                ]
+            )
+            + "\n\n",
+            # atomic_outputs=True,
+        )
+
+    kernel = kernels[_B]
 
     outputs = kernel(
         inputs=[mx.flatten(x, 0, -2), w, s, b, group_size],
@@ -177,6 +195,7 @@ if __name__ == "__main__":
         help="Print generated kernels",
     )
     parser.add_argument("--slice", type=int, default=None)
+    parser.add_argument("-N", type=int, default=8)
     parser.add_argument("-K", type=int, default=64)
     parser.add_argument("-M", type=int, default=8)
     parser.add_argument("--benchmark", "-b", action="store_true", default=False)
@@ -188,7 +207,7 @@ if __name__ == "__main__":
 
     mx.random.seed(42)
     dtype = mx.float16
-    N = 8
+    N = args.N
     K = args.K
     M = args.M
 
@@ -268,7 +287,6 @@ if __name__ == "__main__":
     print(target[:6, :6])
     print(target)
 
-
     x0 = x[[0]]
     mx.eval(x0)
     washout()
@@ -278,7 +296,6 @@ if __name__ == "__main__":
     washout()
     mx.eval(mx.quantized_matmul(x0, wq6, s6, b6, bits=6))
     washout()
-
 
     o = matmul(
         x,
@@ -324,7 +341,6 @@ if __name__ == "__main__":
 
     mx.synchronize()
 
-
     if args.benchmark:
         from functools import partial
 
@@ -332,15 +348,23 @@ if __name__ == "__main__":
 
         custom_method = matmul
         custom_method_batched = partial(
-            custom_method, w=wq, s=s, b=b, group_size=64,
+            custom_method,
+            w=wq,
+            s=s,
+            b=b,
+            group_size=64,
         )
         compiled_custom_batched = mx.compile(custom_method_batched)
 
         print(FILE_PATH)
 
-        bench_print(custom_method_batched, f"Custom 4-bits Not-compiled batch size {N}", x)
+        bench_print(
+            custom_method_batched, f"Custom 4-bits Not-compiled batch size {N}", x
+        )
         print("-" * 20)
-        bench_print(compiled_custom_batched, f"Custom 4-bits compiled batch size {N}", x)
+        bench_print(
+            compiled_custom_batched, f"Custom 4-bits compiled batch size {N}", x
+        )
         print("-" * 20)
 
         mlx_qmm = lambda x: mx.quantized_matmul(x, wq, s, b)

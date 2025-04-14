@@ -78,7 +78,7 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=attention_bias)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False) # temp hardcore attention bias
 
         self.fast_rope = initialize_rope(
             self.head_dim,
